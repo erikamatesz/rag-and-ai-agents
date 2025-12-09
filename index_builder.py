@@ -1,5 +1,6 @@
 import os
 import pickle
+import json  # para salvar metadados legíveis
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
@@ -9,16 +10,24 @@ from pypdf import PdfReader
 from rag_core import EMBED_MODEL
 import ollama
 
+# ======= Cores para logs (ANSI) =======
+COLOR_RESET = "\033[0m"
+COLOR_BLUE = "\033[94m"
+COLOR_GREEN = "\033[92m"
+COLOR_YELLOW = "\033[93m"
+COLOR_MAGENTA = "\033[95m"
+COLOR_RED = "\033[91m"
 
 DOCS_DIR = "docs"
 INDEX_DIR = "index"
 CHUNKS_PATH = os.path.join(INDEX_DIR, "chunks.pkl")
 METADATA_PATH = os.path.join(INDEX_DIR, "chunks_meta.pkl")
 FAISS_INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
+CHUNKS_JSON_PATH = os.path.join(INDEX_DIR, "chunks_with_metadata.json")
 
-# Se continuar dando erro, pode reduzir ainda mais esse tamanho
-CHUNK_SIZE_WORDS = 250
-CHUNK_OVERLAP_WORDS = 50
+# Chunk por caracteres
+CHUNK_SIZE_CHARS = 1200
+CHUNK_OVERLAP_CHARS = 300
 
 
 # =========================
@@ -26,21 +35,20 @@ CHUNK_OVERLAP_WORDS = 50
 # =========================
 
 def load_pdfs(docs_dir: str = DOCS_DIR) -> List[Tuple[str, str]]:
-    """
-    Lê todos os PDFs da pasta docs e retorna uma lista de tuplas:
-    (nome_arquivo, texto_do_pdf).
-    """
+    print(f"{COLOR_BLUE}Carregando PDFs da pasta ./{docs_dir} ...{COLOR_RESET}")
     texts: List[Tuple[str, str]] = []
+
     if not os.path.isdir(docs_dir):
+        print(f"{COLOR_RED}Pasta '{docs_dir}' não encontrada!{COLOR_RESET}")
         return texts
 
     for filename in os.listdir(docs_dir):
         if filename.lower().endswith(".pdf"):
+            print(f"{COLOR_MAGENTA}Lendo PDF:{COLOR_RESET} {filename}")
             path = os.path.join(docs_dir, filename)
-            print(f"Lendo PDF: {filename}...")
             reader = PdfReader(path)
-            pages_text = []
 
+            pages_text = []
             for page_idx, page in enumerate(reader.pages):
                 page_text = page.extract_text() or ""
                 pages_text.append(page_text)
@@ -48,36 +56,34 @@ def load_pdfs(docs_dir: str = DOCS_DIR) -> List[Tuple[str, str]]:
             full_text = "\n".join(pages_text).strip()
             if full_text:
                 texts.append((filename, full_text))
+            else:
+                print(f"{COLOR_YELLOW}AVISO: PDF '{filename}' sem texto extraível.{COLOR_RESET}")
 
+    print(f"{COLOR_GREEN}{len(texts)} documento(s) PDF carregado(s).{COLOR_RESET}")
     return texts
 
 
 # =========================
-# CHUNKING
+# CHUNKING (por CARACTERES)
 # =========================
 
 def chunk_text(
     text: str,
-    chunk_size_words: int = CHUNK_SIZE_WORDS,
-    overlap_words: int = CHUNK_OVERLAP_WORDS,
+    chunk_size_chars: int = CHUNK_SIZE_CHARS,
+    overlap_chars: int = CHUNK_OVERLAP_CHARS,
 ) -> List[str]:
-    """
-    Divide um texto em pedaços (chunks) por quantidade de palavras,
-    com sobreposição simples.
-    """
-    words = text.split()
+
     chunks: List[str] = []
+    n = len(text)
     start = 0
-    n = len(words)
 
     while start < n:
-        end = start + chunk_size_words
-        chunk_words = words[start:end]
-        chunk = " ".join(chunk_words).strip()
+        end = start + chunk_size_chars
+        chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        # avança com sobreposição
-        start = end - overlap_words
+
+        start = end - overlap_chars  # avança com sobreposição
 
     return chunks
 
@@ -85,28 +91,21 @@ def chunk_text(
 def build_corpus_chunks(
     docs: List[Tuple[str, str]]
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """
-    Aplica chunking em todos os documentos e devolve:
-    - lista de chunks (strings)
-    - lista de metadados por chunk (dicts)
-      ex.: {"doc_name": "arquivo.pdf", "chunk_id": 0}
-    """
+
+    print(f"{COLOR_BLUE}Iniciando chunking por documento...{COLOR_RESET}\n")
+
     all_chunks: List[str] = []
     metadata: List[Dict[str, Any]] = []
 
     for doc_name, text in docs:
-        print(f"Fazendo chunking do documento: {doc_name}...")
+        print(f"{COLOR_MAGENTA}→ Fazendo chunking do documento:{COLOR_RESET} {doc_name}")
         chunks_doc = chunk_text(text)
 
         for i, chunk in enumerate(chunks_doc):
             all_chunks.append(chunk)
-            metadata.append(
-                {
-                    "doc_name": doc_name,
-                    "chunk_id": i,
-                }
-            )
+            metadata.append({"doc_name": doc_name, "chunk_id": i})
 
+    print(f"\n{COLOR_GREEN}Total de {len(all_chunks)} chunks gerados para o corpus.{COLOR_RESET}\n")
     return all_chunks, metadata
 
 
@@ -119,63 +118,51 @@ def embed_chunks_with_logging(
     metadata: List[Dict[str, Any]],
     model: str = EMBED_MODEL,
 ) -> Tuple[np.ndarray, List[str], List[Dict[str, Any]]]:
-    """
-    Gera embeddings usando o Ollama, exibindo qual documento está sendo processado
-    e IGNORANDO chunks que derem erro (para não derrubar toda a indexação).
 
-    Retorna:
-    - embeddings (np.ndarray)
-    - chunks_ok (lista de strings, apenas os chunks que deram certo)
-    - metadata_ok (lista de metadados correspondente)
-    """
+    print(f"{COLOR_BLUE}Gerando embeddings com Ollama (pode levar algum tempo)...{COLOR_RESET}")
+
     vectors = []
     chunks_ok: List[str] = []
     metadata_ok: List[Dict[str, Any]] = []
 
     total = len(chunks)
     for i, (chunk, meta) in enumerate(zip(chunks, metadata)):
-        doc_name = meta.get("doc_name")
-        chunk_id = meta.get("chunk_id")
-
         print(
-            f"Gerando embedding do chunk {chunk_id} "
-            f"do documento '{doc_name}' "
-            f"({i + 1}/{total})..."
+            f"{COLOR_YELLOW}Embedding chunk {meta.get('chunk_id')} "
+            f"de '{meta.get('doc_name')}' ({i + 1}/{total})...{COLOR_RESET}"
         )
 
         try:
             res = ollama.embeddings(model=model, prompt=chunk)
             emb = res["embedding"]
+
             vectors.append(emb)
             chunks_ok.append(chunk)
             metadata_ok.append(meta)
 
         except Exception as e:
-            # Aqui tratamos o erro do Ollama e seguimos em frente
             print(
-                f"ERRO ao gerar embedding deste chunk "
-                f"(doc={doc_name}, chunk={chunk_id}). "
-                f"Ele será IGNORADO.\nDetalhe: {e}\n"
+                f"{COLOR_RED}ERRO ao gerar embedding do chunk "
+                f"(doc={meta.get('doc_name')}, chunk={meta.get('chunk_id')}). "
+                f"Ignorando este chunk.\nDetalhe: {e}{COLOR_RESET}\n"
             )
             continue
 
     if not vectors:
         raise RuntimeError(
-            "Nenhum embedding foi gerado. "
-            "Verifique se o Ollama está rodando e se o modelo de embedding está correto."
+            f"{COLOR_RED}Nenhum embedding foi gerado — Ollama pode estar offline ou com falha.{COLOR_RESET}"
         )
 
-    embeddings = np.array(vectors, dtype="float32")
-    return embeddings, chunks_ok, metadata_ok
+    print(f"{COLOR_GREEN}Embeddings gerados com sucesso: {len(vectors)} chunks.{COLOR_RESET}")
+    return np.array(vectors, dtype="float32"), chunks_ok, metadata_ok
 
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatL2:
-    """
-    Cria um índice FAISS L2 simples na memória.
-    """
+    print(f"{COLOR_BLUE}Construindo índice FAISS na memória...{COLOR_RESET}")
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
+    print(f"{COLOR_GREEN}Índice FAISS criado com dimensão {dim}.{COLOR_RESET}")
     return index
 
 
@@ -184,52 +171,66 @@ def save_index_and_chunks(
     chunks: List[str],
     metadata: List[Dict[str, Any]],
 ) -> None:
-    """
-    Salva o índice FAISS, os chunks e os metadados em disco.
-    """
+
+    print(f"{COLOR_BLUE}Salvando índice e metadados no disco...{COLOR_RESET}")
     os.makedirs(INDEX_DIR, exist_ok=True)
 
-    # salva o índice FAISS
     faiss.write_index(index, FAISS_INDEX_PATH)
+    print(f"{COLOR_GREEN}→ Índice salvo em: {FAISS_INDEX_PATH}{COLOR_RESET}")
 
-    # salva os chunks (apenas o texto)
     with open(CHUNKS_PATH, "wb") as f:
         pickle.dump(chunks, f)
+    print(f"{COLOR_GREEN}→ Chunks salvos em: {CHUNKS_PATH}{COLOR_RESET}")
 
-    # salva os metadados em arquivo separado
     with open(METADATA_PATH, "wb") as f:
         pickle.dump(metadata, f)
+    print(f"{COLOR_GREEN}→ Metadados salvos em: {METADATA_PATH}{COLOR_RESET}")
 
-    print(f"Índice salvo em: {FAISS_INDEX_PATH}")
-    print(f"Chunks salvos em: {CHUNKS_PATH}")
-    print(f"Metadados dos chunks salvos em: {METADATA_PATH}")
+    # JSON legível
+    chunks_for_json = []
+    for i, (chunk_text, meta) in enumerate(zip(chunks, metadata)):
+        chunks_for_json.append({
+            "global_chunk_idx": i,
+            "doc_name": meta.get("doc_name"),
+            "chunk_id": meta.get("chunk_id"),
+            "text": chunk_text,
+        })
+
+    with open(CHUNKS_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(chunks_for_json, f, ensure_ascii=False, indent=2)
+
+    print(f"{COLOR_GREEN}→ JSON legível salvo em: {CHUNKS_JSON_PATH}{COLOR_RESET}")
 
 
 def main():
-    print("Carregando PDFs da pasta ./docs ...")
+    print(f"{COLOR_BLUE}=== INICIANDO INDEXAÇÃO ==={COLOR_RESET}")
+
     docs = load_pdfs()
     if not docs:
-        print("Nenhum PDF encontrado em ./docs. Adicione materiais sobre IA.")
+        print(f"{COLOR_RED}Nenhum PDF encontrado. Abortando.{COLOR_RESET}")
         return
 
-    print(f"{len(docs)} documento(s) PDF carregado(s).")
-    print("Iniciando chunking por documento...\n")
-
     chunks, metadata = build_corpus_chunks(docs)
-    print(f"\nTotal de {len(chunks)} trecho(s) gerado(s) para o corpus.\n")
 
-    print("Gerando embeddings com Ollama (pode levar alguns instantes)...")
     embeddings, chunks_ok, metadata_ok = embed_chunks_with_logging(
         chunks, metadata, model=EMBED_MODEL
     )
 
-    print("Construindo índice FAISS na memória...")
     index = build_faiss_index(embeddings)
 
-    print("Salvando índice, chunks e metadados em disco...")
     save_index_and_chunks(index, chunks_ok, metadata_ok)
 
-    print("\nIndexação concluída com sucesso!")
+    print(f"\n{COLOR_GREEN}Indexação concluída com sucesso!{COLOR_RESET}\n")
+
+    print(f"{COLOR_BLUE}Exemplos de chunks indexados:{COLOR_RESET}")
+    for i, (chunk, meta) in enumerate(zip(chunks_ok, metadata_ok)):
+        if i >= 3:
+            break
+        preview = chunk[:200].replace("\n", " ")
+        print(
+            f"{COLOR_YELLOW}- global_chunk_idx={i}, doc={meta.get('doc_name')}, "
+            f"chunk_id={meta.get('chunk_id')}{COLOR_RESET}\n  {preview!r}\n"
+        )
 
 
 if __name__ == "__main__":

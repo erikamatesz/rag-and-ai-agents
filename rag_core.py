@@ -5,8 +5,11 @@ import faiss
 import ollama
 
 # Modelo de embedding usado tanto na indexação quanto na query
-EMBED_MODEL = "nomic-embed-text"
-TOP_K_DEFAULT = 4
+EMBED_MODEL = "nomic-embed-text:v1.5"
+TOP_K_DEFAULT = 20
+
+# Modelo de linguagem para tradução (pode ser o mesmo que você usa nos agentes)
+LLM_MODEL_TRADUCAO = "gemma3:4b"
 
 
 def embed_texts(texts: List[str], model: str = EMBED_MODEL) -> np.ndarray:
@@ -23,6 +26,40 @@ def embed_texts(texts: List[str], model: str = EMBED_MODEL) -> np.ndarray:
     return np.array(vectors, dtype="float32")
 
 
+def traduzir_para_ingles(texto: str) -> str:
+    """
+    Traduz um texto (potencialmente em português) para inglês,
+    mantendo termos técnicos de IA o mais fiéis possível.
+
+    Se der algum erro, devolve o texto original.
+    """
+    try:
+        prompt = f"""
+Traduza o texto a seguir para INGLÊS, mantendo a terminologia técnica de Inteligência Artificial correta.
+Não explique nada, responda SOMENTE com a tradução em inglês.
+
+Texto:
+\"\"\"{texto}\"\"\"
+"""
+        resp = ollama.chat(
+            model=LLM_MODEL_TRADUCAO,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Você é um tradutor técnico PT->EN especializado em Inteligência Artificial."
+                },
+                {"role": "user", "content": prompt.strip()},
+            ],
+        )
+        traducao = resp["message"]["content"].strip()
+        if not traducao:
+            return texto
+        return traducao
+    except Exception as e:
+        print(f"[traduzir_para_ingles] ERRO ao traduzir, usando texto original. Detalhe: {e}")
+        return texto
+
+
 def rag_retrieve(
     query: str,
     index: faiss.IndexFlatL2,
@@ -31,10 +68,12 @@ def rag_retrieve(
     top_k: int = TOP_K_DEFAULT,
 ) -> List[Dict[str, Any]]:
     """
-    Executa o RAG básico:
-    - embed da query
-    - busca no FAISS
-    - retorna uma lista de dicts com:
+    Executa o RAG básico com suporte a queries em português:
+
+    - Traduz a query para inglês (para combinar melhor com documentos em inglês)
+    - Gera embedding da query traduzida
+    - Busca no FAISS
+    - Retorna uma lista de dicts com:
       {
         "text": <texto do chunk>,
         "doc_name": <nome do PDF>,
@@ -43,7 +82,12 @@ def rag_retrieve(
         "distance": <distância L2 no índice>
       }
     """
-    query_emb = embed_texts([query])  # (1, dim)
+    print(f"[rag_retrieve] Query original: {query!r}")
+    query_en = traduzir_para_ingles(query)
+    print(f"[rag_retrieve] Query usada para busca (EN): {query_en!r}")
+
+    # 1) Embedding da query traduzida
+    query_emb = embed_texts([query_en])  # (1, dim)
     distances, indices = index.search(query_emb, top_k)
 
     results: List[Dict[str, Any]] = []
@@ -61,5 +105,13 @@ def rag_retrieve(
                 "distance": float(dists[rank]),
             }
             results.append(item)
+
+    # Log simples pra ver de onde vieram os resultados
+    print("[rag_retrieve] Resultados (doc_name, chunk_id, rank):")
+    for item in results:
+        print(
+            f"  - Rank {item['rank']}: doc={item['doc_name']} | "
+            f"chunk={item['chunk_id']} | dist={item['distance']:.4f}"
+        )
 
     return results

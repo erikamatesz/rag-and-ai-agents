@@ -2,3 +2,5 @@
 venv
 .venv
 index
+output
+__pycache__
