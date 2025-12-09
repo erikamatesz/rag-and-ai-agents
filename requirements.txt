@@ -1,0 +1,4 @@
+faiss-cpu
+ollama
+numpy
+pypdf
